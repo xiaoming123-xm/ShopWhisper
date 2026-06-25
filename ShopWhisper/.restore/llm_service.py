@@ -1,0 +1,272 @@
+"""
+LLM 服务 - 封装 LangChain LLM 调用
+支持多种 LLM 提供商（OpenAI 兼容接口）
+"""
+from typing import Any, AsyncIterator
+import logging
+
+from langchain.schema import AIMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+
+from api.content_filter import filter_llm_output
+from core.config import settings
+from core.resilience import CircuitBreaker, with_timeout
+
+logger = logging.getLogger(__name__)
+
+# 全局 LLM 断路器：连续 5 次失败 → 打开 60s
+_llm_circuit_breaker = CircuitBreaker("LLM", failure_threshold=5, recovery_timeout=60.0)
+
+
+class LLMService:
+    """LLM 服务类"""
+
+    def __init__(self, tenant_id: str):
+        """
+        初始化 LLM 服务
+
+        Args:
+            tenant_id: 租户 ID
+        """
+        self.tenant_id = tenant_id
+        self.model_name = settings.llm_model
+        self._provider = settings.llm_provider
+
+        # 根据 provider 选择正确的配置
+        if self._provider == "volcengine":
+            self._api_key = settings.volcengine_api_key
+            self._api_base = settings.volcengine_api_base
+        else:
+            raise ValueError(f"Unsupported LLM provider: {self._provider}")
+
+        # 验证必需配置
+        if not self._api_key:
+            raise ValueError(f"API key not configured for provider: {self._provider}")
+
+        self._temperature = settings.llm_temperature
+        self._max_tokens = settings.llm_max_tokens
+
+        # 初始化 LLM
+        self.llm = self._initialize_llm()
+
+    def _initialize_llm(self):
+        """
+        初始化 LLM 实例，根据 provider 选择合适的实现
+        """
+        return ChatOpenAI(
+            model=self.model_name,
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            openai_api_key=self._api_key,
+            openai_api_base=self._api_base,
+            streaming=False,
+        )
+
+    def get_streaming_llm(self):
+        """获取支持流式输出的 LLM 实例"""
+        return ChatOpenAI(
+            model=self.model_name,
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            openai_api_key=self._api_key,
+            openai_api_base=self._api_base,
+            streaming=True,
+        )
+
+    def _build_lc_messages(
+        self,
+        messages: list[dict[str, str]],
+        system_prompt: str | None = None,
+    ) -> list:
+        """Convert dict messages to LangChain message objects."""
+        lc_messages = []
+        if system_prompt:
+            lc_messages.append(SystemMessage(content=system_prompt))
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role == "user":
+                lc_messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                lc_messages.append(AIMessage(content=content))
+            elif role == "system":
+                lc_messages.append(SystemMessage(content=content))
+        return lc_messages
+
+    async def astream(
+        self,
+        messages: list[dict[str, str]],
+        system_prompt: str | None = None,
+        enable_safety_filter: bool = True,
+    ) -> AsyncIterator[dict]:
+        """
+        Real streaming generation via LangChain's astream().
+        含断路器保护：连续失败时快速拒绝，避免雪崩。
+
+        Yields:
+            {"type": "chunk", "content": "token text"}
+            {"type": "done", "content": "full text", "input_tokens": N,
+             "output_tokens": N, "model": "..."}
+        """
+        streaming_llm = self.get_streaming_llm()
+        lc_messages = self._build_lc_messages(messages, system_prompt)
+
+        full_content = ""
+        async with _llm_circuit_breaker:
+            async for chunk in streaming_llm.astream(lc_messages):
+                token = chunk.content or ""
+                if token:
+                    full_content += token
+                    yield {"type": "chunk", "content": token}
+
+        if enable_safety_filter:
+            filtered = filter_llm_output(full_content)
+            if filtered != full_content:
+                logger.info(
+                    "LLM stream output filtered for tenant %s: %d -> %d chars",
+                    self.tenant_id, len(full_content), len(filtered),
+                )
+                full_content = filtered
+
+        yield {
+            "type": "done",
+            "content": full_content,
+            "input_tokens": self.count_tokens(
+                " ".join(m.get("content", "") for m in messages)
+            ),
+            "output_tokens": self.count_tokens(full_content),
+            "model": self.model_name,
+            "provider": self._provider,
+        }
+
+    async def generate_response(
+        self,
+        messages: list[dict[str, str]],
+        system_prompt: str | None = None,
+        enable_safety_filter: bool = True,
+    ) -> str:
+        """
+        生成回复（含断路器保护 + 超时 120s）
+
+        Args:
+            messages: 对话历史 [{"role": "user/assistant", "content": "..."}]
+            system_prompt: 系统提示词
+            enable_safety_filter: 是否启用安全过滤（默认True）
+
+        Returns:
+            AI 回复内容（已过滤PII等敏感信息）
+        """
+        langchain_messages = self._build_lc_messages(messages, system_prompt)
+
+        async with _llm_circuit_breaker:
+            response = await with_timeout(
+                self.llm.ainvoke(langchain_messages),
+                timeout=120.0,
+                service_name="LLM",
+            )
+        content = response.content
+
+        if enable_safety_filter:
+            filtered_content = filter_llm_output(content)
+            if filtered_content != content:
+                logger.info(
+                    "LLM output filtered for tenant %s: %d -> %d chars",
+                    self.tenant_id, len(content), len(filtered_content),
+                )
+            return filtered_content
+
+        return content
+
+    async def generate_with_functions(
+        self,
+        messages: list[dict[str, str]],
+        functions: list[dict[str, Any]],
+        system_prompt: str | None = None,
+        enable_safety_filter: bool = True,
+    ) -> dict[str, Any]:
+        """
+        使用函数调用生成回复
+
+        Args:
+            messages: 对话历史
+            functions: 函数定义列表
+            system_prompt: 系统提示词
+            enable_safety_filter: 是否启用安全过滤（默认True）
+
+        Returns:
+            包含回复和函数调用信息的字典
+        """
+        # 构建消息
+        langchain_messages = []
+        if system_prompt:
+            langchain_messages.append(SystemMessage(content=system_prompt))
+
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role == "user":
+                langchain_messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                langchain_messages.append(AIMessage(content=content))
+
+        # 绑定函数
+        llm_with_functions = self.llm.bind_functions(functions)
+
+        # 调用（含断路器 + 超时）
+        async with _llm_circuit_breaker:
+            response = await with_timeout(
+                llm_with_functions.ainvoke(langchain_messages),
+                timeout=120.0,
+                service_name="LLM",
+            )
+
+        # 解析响应
+        content = response.content
+
+        # 应用安全过滤
+        if enable_safety_filter and content:
+            content = filter_llm_output(content)
+
+        result = {
+            "content": content,
+            "function_call": None,
+        }
+
+        # 检查是否有函数调用
+        if hasattr(response, "additional_kwargs"):
+            function_call = response.additional_kwargs.get("function_call")
+            if function_call:
+                result["function_call"] = {
+                    "name": function_call.get("name"),
+                    "arguments": function_call.get("arguments"),
+                }
+
+        return result
+
+    def count_tokens(self, text: str) -> int:
+        """
+        统计 Token 数量
+        
+        Args:
+            text: 文本内容
+            
+        Returns:
+            Token 数量
+        """
+        # 使用 LangChain 的 token 计数
+        return self.llm.get_num_tokens(text)
+
+    def get_model_info(self) -> dict[str, Any]:
+        """
+        获取模型信息
+        
+        Returns:
+            模型信息字典
+        """
+        return {
+            "model_name": self.model_name,
+            "tenant_id": self.tenant_id,
+            "provider": self._provider,
+            "supports_streaming": True,
+            "supports_functions": self._provider != "anthropic",
+        }

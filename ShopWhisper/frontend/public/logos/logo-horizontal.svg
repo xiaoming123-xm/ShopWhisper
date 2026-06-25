@@ -1,0 +1,72 @@
+<svg width="300" height="80" viewBox="0 0 300 80" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="logoGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#667eea;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#764ba2;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#f093fb;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#f5576c;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- 图标部分 -->
+  <g transform="translate(10, 10)">
+    <!-- 背景圆 -->
+    <circle cx="30" cy="30" r="28" fill="url(#logoGrad)" opacity="0.15"/>
+
+    <!-- 聊天气泡 -->
+    <path d="M 15 20 Q 15 15 20 15 L 35 15 Q 40 15 40 20 L 40 30 Q 40 35 35 35 L 25 35 L 18 42 L 18 35 Q 15 35 15 30 Z"
+          fill="url(#logoGrad)"/>
+
+    <!-- AI 图标 -->
+    <g transform="translate(22, 22)">
+      <circle cx="0" cy="0" r="2" fill="white"/>
+      <circle cx="8" cy="0" r="2" fill="white"/>
+      <circle cx="16" cy="0" r="2" fill="white"/>
+      <line x1="0" y1="0" x2="8" y2="0" stroke="white" stroke-width="1.5"/>
+      <line x1="8" y1="0" x2="16" y2="0" stroke="white" stroke-width="1.5"/>
+    </g>
+
+    <!-- 购物车 -->
+    <g transform="translate(42, 42)">
+      <rect x="0" y="0" width="12" height="10" rx="1" fill="url(#accentGrad)"/>
+      <circle cx="3" cy="13" r="2" fill="url(#accentGrad)"/>
+      <circle cx="9" cy="13" r="2" fill="url(#accentGrad)"/>
+    </g>
+
+    <!-- 闪电 -->
+    <path d="M 48 18 L 45 26 L 48 26 L 46 32 L 53 25 L 50 25 L 52 18 Z"
+          fill="#fbbf24"/>
+  </g>
+
+  <!-- 文字部分 -->
+  <g transform="translate(80, 0)">
+    <!-- 主标题 -->
+    <text x="0" y="35" font-family="'Arial Black', Arial, sans-serif" font-size="28" font-weight="bold"
+          fill="url(#logoGrad)">
+      ShopWhisper
+    </text>
+
+    <!-- 副标题 -->
+    <text x="0" y="55" font-family="Arial, sans-serif" font-size="12"
+          fill="#6b7280">
+      电商智能客服 SaaS 平台
+    </text>
+
+    <!-- 标签 -->
+    <g transform="translate(0, 60)">
+      <rect x="0" y="0" width="35" height="16" rx="8" fill="url(#logoGrad)" opacity="0.2"/>
+      <text x="17.5" y="11" font-family="Arial, sans-serif" font-size="9" font-weight="bold"
+            text-anchor="middle" fill="url(#logoGrad)">
+        AI
+      </text>
+
+      <rect x="40" y="0" width="50" height="16" rx="8" fill="url(#accentGrad)" opacity="0.2"/>
+      <text x="65" y="11" font-family="Arial, sans-serif" font-size="9" font-weight="bold"
+            text-anchor="middle" fill="url(#accentGrad)">
+        SaaS
+      </text>
+    </g>
+  </g>
+</svg>

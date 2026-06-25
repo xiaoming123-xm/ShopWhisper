@@ -1,0 +1,1450 @@
+"""
+管理员 API 路由（平台管理）
+"""
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter, Depends, Query, Request
+from sqlalchemy import and_, func, select
+
+from api.dependencies import AdminDep, DBDep, require_admin_permission
+from core import AdminRole, Permission, create_access_token
+from models import Subscription, Tenant
+from schemas import (
+    AdminCreate,
+    AdminLoginRequest,
+    AdminLoginResponse,
+    AdminResponse,
+    AdminUpdate,
+    ApiResponse,
+    BatchOperationRequest,
+    BatchOperationResponse,
+    PaginatedResponse,
+    TenantCreate,
+    TenantResponse,
+    TenantUpdateStatus,
+    TenantWithAPIKey,
+)
+from schemas.admin import AdminChangePasswordRequest
+from services import AdminService, AuditService, SubscriptionService, TenantService
+from core.permissions import SUBSCRIPTION_PLANS
+from core.crypto import decrypt_field, encrypt_field
+from models.platform_app import PlatformApp
+from schemas.platform import PlatformAppCreate, PlatformAppResponse, PlatformAppUpdate
+
+router = APIRouter(prefix="/admin", tags=["管理员"])
+
+
+# ============ 管理员认证 ============
+@router.post("/login", response_model=ApiResponse[AdminLoginResponse])
+async def admin_login(
+    login_data: AdminLoginRequest,
+    db: DBDep,
+):
+    """管理员登录"""
+    service = AdminService(db)
+    admin = await service.authenticate_admin(
+        username=login_data.username,
+        password=login_data.password,
+    )
+
+    if not admin:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    # 刷新对象以加载所有属性
+    await db.refresh(admin)
+
+    # 生成Token
+    token = create_access_token(
+        subject=admin.admin_id,
+        role=admin.role,
+    )
+
+    # 手动序列化 ORM 对象以避免 lazy loading 问题
+    admin_dict = {
+        "id": admin.id,
+        "admin_id": admin.admin_id,
+        "username": admin.username,
+        "email": admin.email,
+        "phone": admin.phone,
+        "role": admin.role,
+        "permissions": admin.permissions,
+        "status": admin.status,
+        "created_at": admin.created_at,
+        "updated_at": admin.updated_at,
+        "last_login_at": admin.last_login_at,
+        "last_login_ip": admin.last_login_ip,
+    }
+
+    response = AdminLoginResponse.model_validate({
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": 28800,  # 8小时
+        "admin": AdminResponse.model_validate(admin_dict)
+    })
+
+    return ApiResponse(data=response)
+
+
+@router.post("/change-password", response_model=ApiResponse[dict])
+async def admin_change_password(
+    password_data: AdminChangePasswordRequest,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    管理员修改密码
+
+    修改当前管理员的登录密码
+    """
+    service = AdminService(db)
+    await service.change_password(
+        admin_id=admin.admin_id,
+        old_password=password_data.current_password,
+        new_password=password_data.new_password,
+    )
+
+    return ApiResponse(data={"message": "密码修改成功"})
+
+
+# ============ 管理员管理 ============
+@router.get(
+    "/admins",
+    response_model=ApiResponse[PaginatedResponse[AdminResponse]],
+    dependencies=[Depends(require_admin_permission(Permission.ADMIN_MANAGE))],
+)
+async def list_admins(
+    admin: AdminDep,
+    db: DBDep,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    role: str | None = None,
+    status: str | None = None,
+    keyword: str | None = None,
+):
+    """
+    获取管理员列表
+
+    权限：仅超级管理员
+    """
+    service = AdminService(db)
+    admins, total = await service.list_admins(
+        page=page,
+        size=size,
+        role=role,
+        status=status,
+        keyword=keyword,
+    )
+
+    paginated = PaginatedResponse.create(
+        items=admins,
+        total=total,
+        page=page,
+        size=size,
+    )
+
+    return ApiResponse(data=paginated)
+
+
+@router.post(
+    "/admins",
+    response_model=ApiResponse[AdminResponse],
+    dependencies=[Depends(require_admin_permission(Permission.ADMIN_MANAGE))],
+)
+async def create_admin(
+    admin_data: AdminCreate,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    创建管理员
+
+    权限：仅超级管理员
+    """
+    service = AdminService(db)
+    new_admin = await service.create_admin(
+        username=admin_data.username,
+        password=admin_data.password,
+        email=admin_data.email,
+        role=AdminRole(admin_data.role),
+        phone=admin_data.phone,
+        created_by=admin.admin_id,
+    )
+
+    # 记录审计日志
+    audit_service = AuditService(db)
+    await audit_service.log_admin_create(
+        admin_id=admin.admin_id,
+        target_admin_id=new_admin.admin_id,
+        admin_data={"username": admin_data.username, "role": admin_data.role},
+    )
+
+    return ApiResponse(data=new_admin)
+
+
+@router.get(
+    "/admins/{admin_id}",
+    response_model=ApiResponse[AdminResponse],
+    dependencies=[Depends(require_admin_permission(Permission.ADMIN_MANAGE))],
+)
+async def get_admin(
+    admin_id: str,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    获取管理员详情
+
+    权限：仅超级管理员
+    """
+    service = AdminService(db)
+    target_admin = await service.get_admin(admin_id)
+    return ApiResponse(data=target_admin)
+
+
+@router.put(
+    "/admins/{admin_id}",
+    response_model=ApiResponse[AdminResponse],
+    dependencies=[Depends(require_admin_permission(Permission.ADMIN_MANAGE))],
+)
+async def update_admin(
+    admin_id: str,
+    update_data: AdminUpdate,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    更新管理员
+
+    权限：仅超级管理员
+    """
+    # 不能修改自己的角色
+    if admin_id == admin.admin_id and update_data.role and update_data.role != admin.role:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="不能修改自己的角色")
+
+    service = AdminService(db)
+
+    # 获取变更前状态
+    old_admin = await service.get_admin(admin_id)
+    old_data = {
+        "email": old_admin.email,
+        "phone": old_admin.phone,
+        "role": old_admin.role,
+        "status": old_admin.status,
+    }
+
+    # 更新管理员
+    updated_admin = await service.update_admin(
+        admin_id=admin_id,
+        email=update_data.email,
+        phone=update_data.phone,
+        role=update_data.role,
+        status=update_data.status,
+        updated_by=admin.admin_id,
+    )
+
+    # 记录审计日志
+    audit_service = AuditService(db)
+    await audit_service.log_admin_update(
+        admin_id=admin.admin_id,
+        target_admin_id=admin_id,
+        before=old_data,
+        after=update_data.model_dump(exclude_unset=True),
+    )
+
+    return ApiResponse(data=updated_admin)
+
+
+@router.delete(
+    "/admins/{admin_id}",
+    response_model=ApiResponse[dict],
+    dependencies=[Depends(require_admin_permission(Permission.ADMIN_MANAGE))],
+)
+async def delete_admin(
+    admin_id: str,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    删除管理员（软删除）
+
+    权限：仅超级管理员
+    """
+    if admin_id == admin.admin_id:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="不能删除自己")
+
+    service = AdminService(db)
+
+    # 获取要删除的管理员信息
+    target_admin = await service.get_admin(admin_id)
+
+    # 执行删除
+    await service.delete_admin(admin_id, deleted_by=admin.admin_id)
+
+    # 记录审计日志
+    audit_service = AuditService(db)
+    await audit_service.log_admin_delete(
+        admin_id=admin.admin_id,
+        target_admin_id=admin_id,
+        admin_data={"username": target_admin.username},
+    )
+
+    return ApiResponse(data={"message": "删除成功"})
+
+
+# ============ 租户管理 ============
+@router.get("/tenants", response_model=ApiResponse[PaginatedResponse[TenantResponse]])
+async def list_tenants(
+    admin: AdminDep,
+    db: DBDep,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    status: str | None = None,
+    plan: str | None = None,
+    keyword: str | None = None,
+):
+    """
+    查询租户列表
+    
+    权限：所有管理员
+    """
+    service = TenantService(db)
+    tenants, total = await service.list_tenants(
+        page=page,
+        size=size,
+        status=status,
+        plan=plan,
+        keyword=keyword,
+    )
+
+    paginated = PaginatedResponse.create(
+        items=tenants,
+        total=total,
+        page=page,
+        size=size,
+    )
+
+    return ApiResponse(data=paginated)
+
+
+# ============ 欠费租户管理 (必须在 /tenants/{tenant_id} 之前定义) ============
+@router.get("/tenants/overdue")
+async def get_overdue_tenants(
+    admin: AdminDep,
+    db: DBDep,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    min_days_overdue: int = Query(0, ge=0, description="最小逾期天数"),
+):
+    """
+    获取欠费租户列表
+
+    返回有未支付账单的租户信息
+
+    参数：
+    - page: 页码
+    - page_size: 每页数量
+    - min_days_overdue: 最小逾期天数（0表示所有欠费租户）
+
+    权限：需要 BILLING_READ 权限
+    """
+    from models.tenant import Bill
+    from schemas.billing import OverdueTenantInfo, OverdueTenantListResponse
+
+    now = datetime.utcnow()
+
+    # 查询有欠费的租户
+    subquery = (
+        select(
+            Bill.tenant_id,
+            func.sum(Bill.total_amount).label("total_overdue"),
+            func.min(Bill.due_date).label("oldest_due_date"),
+            func.count(Bill.id).label("overdue_bills_count"),
+        )
+        .where(
+            and_(
+                Bill.status.in_(["pending", "overdue"]),
+                Bill.due_date < now,
+            )
+        )
+        .group_by(Bill.tenant_id)
+        .subquery()
+    )
+
+    query = (
+        select(Tenant, subquery.c)
+        .join(subquery, Tenant.tenant_id == subquery.c.tenant_id)
+    )
+
+    # 按逾期天数过滤
+    if min_days_overdue > 0:
+        threshold_date = now - timedelta(days=min_days_overdue)
+        query = query.where(subquery.c.oldest_due_date <= threshold_date)
+
+    # 按欠费金额排序
+    query = query.order_by(subquery.c.total_overdue.desc())
+
+    # 获取总数
+    count_query = select(func.count()).select_from(query.subquery())
+    total_result = await db.execute(count_query)
+    total = total_result.scalar() or 0
+
+    # 分页
+    query = query.offset((page - 1) * page_size).limit(page_size)
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    items = []
+    for row in rows:
+        tenant = row[0]
+        total_overdue = row.total_overdue
+        oldest_due_date = row.oldest_due_date
+        bills_count = row.overdue_bills_count
+        days_overdue = (now - oldest_due_date).days if oldest_due_date else 0
+
+        items.append(
+            OverdueTenantInfo(
+                tenant_id=tenant.tenant_id,
+                company_name=tenant.company_name,
+                contact_name=tenant.contact_name,
+                email=tenant.contact_email,
+                phone=tenant.contact_phone,
+                total_overdue=float(total_overdue),
+                overdue_bills_count=bills_count,
+                days_overdue=days_overdue,
+                oldest_due_date=oldest_due_date,
+                degradation_level=getattr(tenant, "degradation_level", None),
+            )
+        )
+
+    response = OverdueTenantListResponse(
+        total=total,
+        page=page,
+        page_size=page_size,
+        items=items,
+    )
+
+    return ApiResponse(data=response)
+
+
+@router.get("/tenants/{tenant_id}", response_model=ApiResponse[TenantResponse])
+async def get_tenant(
+    tenant_id: str,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    获取租户详情
+    
+    权限：所有管理员
+    """
+    service = TenantService(db)
+    tenant = await service.get_tenant(tenant_id)
+    return ApiResponse(data=tenant)
+
+
+@router.post(
+    "/tenants",
+    response_model=ApiResponse[TenantWithAPIKey],
+    dependencies=[Depends(require_admin_permission(Permission.TENANT_CREATE))],
+)
+async def create_tenant(
+    tenant_data: TenantCreate,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    创建租户（代客开户）
+    
+    权限：super_admin, support_admin
+    """
+    service = TenantService(db)
+    tenant, api_key = await service.create_tenant(
+        tenant_data=tenant_data,
+        created_by=admin.admin_id,
+    )
+
+    # 记录审计日志
+    audit_service = AuditService(db)
+    await audit_service.log_tenant_create(
+        admin_id=admin.admin_id,
+        tenant_id=tenant.tenant_id,
+        tenant_data=tenant_data.model_dump(),
+    )
+
+    # 返回包含API Key的响应
+    response = TenantWithAPIKey(
+        **tenant.__dict__,
+        api_key=api_key,
+    )
+
+    return ApiResponse(data=response)
+
+
+@router.put(
+    "/tenants/{tenant_id}/status",
+    response_model=ApiResponse[TenantResponse],
+    dependencies=[Depends(require_admin_permission(Permission.TENANT_SUSPEND))],
+)
+async def update_tenant_status(
+    tenant_id: str,
+    status_data: TenantUpdateStatus,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    更新租户状态
+    
+    权限：super_admin, support_admin
+    """
+    service = TenantService(db)
+
+    # 获取变更前状态
+    old_tenant = await service.get_tenant(tenant_id)
+    old_status = old_tenant.status
+
+    # 更新状态
+    tenant = await service.update_tenant_status(
+        tenant_id=tenant_id,
+        status=status_data.status,
+        reason=status_data.reason,
+    )
+
+    # 记录审计日志
+    audit_service = AuditService(db)
+    await audit_service.log_tenant_update(
+        admin_id=admin.admin_id,
+        tenant_id=tenant_id,
+        before={"status": old_status},
+        after={"status": status_data.status, "reason": status_data.reason},
+    )
+
+    return ApiResponse(data=tenant)
+
+
+@router.get(
+    "/subscriptions/plans",
+    response_model=ApiResponse[dict],
+)
+async def list_subscription_plans():
+    """获取可用套餐列表及价格"""
+    return ApiResponse(data={"plans": SUBSCRIPTION_PLANS})
+
+
+@router.post(
+    "/tenants/{tenant_id}/assign-plan",
+    response_model=ApiResponse[dict],
+    dependencies=[Depends(require_admin_permission(Permission.SUBSCRIPTION_UPDATE))],
+)
+async def assign_plan(
+    tenant_id: str,
+    plan_type: str = Query(..., description="套餐类型 (trial/monthly/quarterly/semi_annual/annual)"),
+    days: int | None = Query(None, ge=1, description="自定义天数（可选，覆盖套餐默认时长）"),
+    admin: AdminDep = None,
+    db: DBDep = None,
+):
+    """
+    分配套餐（支持新订阅套餐，续费时叠加时间）
+
+    权限：super_admin, support_admin
+    """
+    service = SubscriptionService(db)
+    subscription = await service.assign_plan(
+        tenant_id=tenant_id,
+        plan_type=plan_type,
+        days=days,
+    )
+
+    # 记录审计日志
+    audit_service = AuditService(db)
+    await audit_service.log_plan_change(
+        admin_id=admin.admin_id,
+        tenant_id=tenant_id,
+        old_plan="",
+        new_plan=plan_type,
+    )
+
+    return ApiResponse(data={
+        "subscription_id": subscription.subscription_id,
+        "tenant_id": subscription.tenant_id,
+        "plan_type": subscription.plan_type,
+        "status": subscription.status,
+        "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
+        "expire_at": subscription.expire_at.isoformat() if subscription.expire_at else None,
+        "auto_renew": subscription.auto_renew,
+        "is_trial": subscription.is_trial,
+    })
+
+
+@router.post(
+    "/tenants/batch-operation",
+    response_model=ApiResponse[BatchOperationResponse],
+    dependencies=[Depends(require_admin_permission(Permission.TENANT_UPDATE))],
+)
+async def batch_operation(
+    batch_data: BatchOperationRequest,
+    admin: AdminDep,
+    db: DBDep,
+    request: Request,
+):
+    """
+    批量操作租户
+    
+    支持的操作类型：
+    - activate: 激活租户
+    - suspend: 暂停租户
+    - delete: 删除租户（软删除）
+    - upgrade_plan: 升级套餐（需要params.plan参数）
+    - downgrade_plan: 降级套餐（需要params.plan参数）
+    - extend_service: 延期服务（需要params.days参数，默认30天）
+
+    权限：super_admin, support_admin
+    """
+    tenant_service = TenantService(db)
+    subscription_service = SubscriptionService(db)
+    audit_service = AuditService(db)
+    
+    results = {"success": [], "failed": []}
+    
+    # 根据操作类型调用不同的服务方法
+    if batch_data.operation == "activate":
+        results = await tenant_service.batch_activate_tenants(batch_data.tenant_ids)
+    
+    elif batch_data.operation == "suspend":
+        results = await tenant_service.batch_suspend_tenants(batch_data.tenant_ids)
+    
+    elif batch_data.operation == "delete":
+        results = await tenant_service.batch_delete_tenants(batch_data.tenant_ids)
+    
+    elif batch_data.operation == "upgrade_plan":
+        new_plan = batch_data.params.get("plan") if batch_data.params else None
+        if not new_plan:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail="升级套餐需要提供 params.plan 参数")
+        results = await subscription_service.batch_upgrade_plan(batch_data.tenant_ids, new_plan)
+    
+    elif batch_data.operation == "downgrade_plan":
+        new_plan = batch_data.params.get("plan") if batch_data.params else None
+        if not new_plan:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail="降级套餐需要提供 params.plan 参数")
+        results = await subscription_service.batch_downgrade_plan(batch_data.tenant_ids, new_plan)
+    
+    elif batch_data.operation == "extend_service":
+        days = batch_data.params.get("days", 30) if batch_data.params else 30
+        results = await subscription_service.batch_extend_service(
+            tenant_ids=batch_data.tenant_ids,
+            days=days,
+        )
+
+    else:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=f"不支持的操作: {batch_data.operation}")
+    
+    # 记录审计日志
+    await audit_service.log_batch_operation(
+        admin_id=admin.admin_id,
+        operation=batch_data.operation,
+        tenant_ids=batch_data.tenant_ids[:10],  # 最多记录10个
+        params=batch_data.params,
+        success_count=len(results["success"]),
+        failed_count=len(results["failed"]),
+    )
+    
+    response = BatchOperationResponse(
+        success=results["success"],
+        failed=results["failed"],
+        total=len(batch_data.tenant_ids),
+        success_count=len(results["success"]),
+        failed_count=len(results["failed"]),
+    )
+
+    return ApiResponse(data=response)
+
+
+@router.post("/tenants/{tenant_id}/send-reminder")
+async def send_payment_reminder(
+    tenant_id: str,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    发送催款提醒
+    
+    向租户发送邮件/短信催款提醒
+    
+    权限：需要 BILLING_UPDATE 权限
+    """
+    from models.tenant import Bill
+    
+    service = TenantService(db)
+    tenant = await service.get_tenant(tenant_id)
+    
+    # 获取欠费信息
+    overdue_stmt = select(Bill).where(
+        and_(
+            Bill.tenant_id == tenant_id,
+            Bill.status.in_(["pending", "overdue"]),
+            Bill.due_date < datetime.utcnow(),
+        )
+    )
+    result = await db.execute(overdue_stmt)
+    overdue_bills = result.scalars().all()
+    
+    if not overdue_bills:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="该租户无欠费账单")
+    
+    total_overdue = sum(b.total_amount for b in overdue_bills)
+    
+    # 发送异步任务通知（Celery任务，这里先注释掉）
+    # from tasks.notification_tasks import send_payment_reminder_notification
+    # send_payment_reminder_notification.delay(
+    #     tenant_id=tenant_id,
+    #     total_overdue=float(total_overdue),
+    #     bills_count=len(overdue_bills),
+    # )
+    
+    # 记录审计日志
+    audit_service = AuditService(db)
+    await audit_service.log_operation(
+        admin_id=admin.admin_id,
+        operation_type="send_payment_reminder",
+        resource_type="tenant",
+        resource_id=tenant_id,
+        operation_details={
+            "total_overdue": float(total_overdue),
+            "bills_count": len(overdue_bills),
+        },
+    )
+    
+    return ApiResponse(data={"message": "催款提醒已发送"})
+
+
+# ============ API密钥管理 ============
+@router.post("/tenants/{tenant_id}/reset-api-key")
+async def reset_tenant_api_key(
+    tenant_id: str,
+    admin: AdminDep,
+    db: DBDep,
+    request: Request,
+):
+    """
+    重置租户API密钥
+    
+    操作流程：
+    1. 生成新的API Key
+    2. 旧Key立即失效
+    3. 清除Redis缓存
+    4. 发送通知给租户
+    5. 记录审计日志
+    
+    权限：需要 TENANT_UPDATE 权限
+    """
+    service = TenantService(db)
+    audit_service = AuditService(db)
+    
+    # 重置API密钥
+    tenant, new_api_key = await service.reset_api_key(tenant_id)
+    
+    # 清除Redis缓存（如果有）
+    redis = getattr(request.app.state, "redis", None)
+    if redis:
+        try:
+            # 清除旧的API Key缓存
+            # 假设缓存key格式为 api_key:{api_key_prefix}
+            await redis.delete(f"api_key:{tenant.tenant_id}")
+            await redis.delete(f"tenant:{tenant.tenant_id}:api_key")
+        except Exception as e:
+            # Redis不可用时不影响主流程
+            pass
+    
+    # 发送通知给租户（Celery任务，这里先注释掉）
+    # from tasks.notification_tasks import send_api_key_reset_notification
+    # send_api_key_reset_notification.delay(
+    #     tenant_id=tenant_id,
+    #     new_api_key=new_api_key,
+    # )
+    
+    # 记录审计日志
+    await audit_service.log_operation(
+        admin_id=admin.admin_id,
+        operation_type="reset_api_key",
+        resource_type="tenant",
+        resource_id=tenant_id,
+        operation_details={
+            "reason": "admin_reset",
+        },
+    )
+    
+    return ApiResponse(
+        data={
+            "api_key": new_api_key,  # 仅此次返回完整key
+            "message": "API密钥已重置，请妥善保管新密钥",
+            "tenant_id": tenant_id,
+        }
+    )
+
+
+# ============ 订阅管理 ============
+@router.get("/subscriptions")
+async def list_subscriptions(
+    admin: AdminDep,
+    db: DBDep,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    status: str | None = None,
+    plan_type: str | None = None,
+    tenant_id: str | None = None,
+):
+    """
+    获取订阅列表
+
+    权限：所有管理员
+    """
+    # 构建查询条件
+    conditions = []
+
+    if status:
+        conditions.append(Subscription.status == status)
+
+    if plan_type:
+        conditions.append(Subscription.plan_type == plan_type)
+
+    if tenant_id:
+        conditions.append(Subscription.tenant_id == tenant_id)
+
+    # 查询总数
+    count_query = select(func.count(Subscription.id))
+    if conditions:
+        count_query = count_query.where(and_(*conditions))
+    total = await db.scalar(count_query) or 0
+
+    # 查询数据
+    query = (
+        select(Subscription, Tenant)
+        .join(Tenant, Subscription.tenant_id == Tenant.tenant_id)
+    )
+    if conditions:
+        query = query.where(and_(*conditions))
+
+    query = query.order_by(Subscription.created_at.desc())
+    query = query.offset((page - 1) * size).limit(size)
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    items = []
+    for subscription, tenant in rows:
+        items.append({
+            "id": subscription.id,
+            "subscription_id": subscription.subscription_id,
+            "tenant_id": subscription.tenant_id,
+            "company_name": tenant.company_name,
+            "plan_type": subscription.plan_type,
+            "status": subscription.status,
+            "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
+            "end_date": subscription.expire_at.isoformat() if subscription.expire_at else None,
+            "expire_at": subscription.expire_at.isoformat() if subscription.expire_at else None,
+            "auto_renew": subscription.auto_renew,
+            "is_trial": subscription.is_trial,
+            "created_at": subscription.created_at.isoformat() if subscription.created_at else None,
+            "updated_at": subscription.updated_at.isoformat() if subscription.updated_at else None,
+        })
+
+    return ApiResponse(data={
+        "items": items,
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": (total + size - 1) // size,
+    })
+
+
+# ============ 订阅操作（延期/暂停/激活） ============
+@router.post("/tenants/{tenant_id}/extend-subscription")
+async def extend_tenant_subscription(
+    tenant_id: str,
+    admin: AdminDep,
+    db: DBDep,
+    days: int = Query(30, ge=1, le=3650, description="延长天数"),
+):
+    """
+    延长租户订阅时间
+
+    权限：super_admin, support_admin
+    """
+    subscription_service = SubscriptionService(db)
+    subscription = await subscription_service.get_subscription(tenant_id)
+
+    new_expire = subscription.expire_at + timedelta(days=days)
+    subscription.expire_at = new_expire
+    if subscription.status == "expired":
+        subscription.status = "active"
+    await db.commit()
+    await db.refresh(subscription)
+
+    return ApiResponse(data={
+        "tenant_id": tenant_id,
+        "new_expire_at": subscription.expire_at.isoformat(),
+        "extended_days": days,
+    })
+
+
+@router.post("/tenants/{tenant_id}/suspend-subscription")
+async def suspend_tenant_subscription(
+    tenant_id: str,
+    admin: AdminDep,
+    db: DBDep,
+    reason: str = Query("", description="暂停原因"),
+):
+    """
+    暂停租户订阅
+
+    权限：super_admin, support_admin
+    """
+    subscription_service = SubscriptionService(db)
+    subscription = await subscription_service.get_subscription(tenant_id)
+
+    subscription.status = "cancelled"
+    await db.commit()
+
+    return ApiResponse(data={
+        "tenant_id": tenant_id,
+        "status": "cancelled",
+        "reason": reason,
+    })
+
+
+@router.post("/tenants/{tenant_id}/activate-subscription")
+async def activate_tenant_subscription(
+    tenant_id: str,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    激活租户订阅
+
+    权限：super_admin, support_admin
+    """
+    subscription_service = SubscriptionService(db)
+    subscription = await subscription_service.get_subscription(tenant_id)
+
+    subscription.status = "active"
+    await db.commit()
+
+    return ApiResponse(data={
+        "tenant_id": tenant_id,
+        "status": "active",
+    })
+
+
+# ============ 账单管理 ============
+@router.get("/bills")
+async def list_bills(
+    admin: AdminDep,
+    db: DBDep,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    status: str | None = None,
+    tenant_id: str | None = None,
+):
+    """
+    获取账单列表
+
+    权限：所有管理员
+    """
+    from models.tenant import Bill
+
+    # 构建查询条件
+    conditions = []
+
+    if status:
+        conditions.append(Bill.status == status)
+
+    if tenant_id:
+        conditions.append(Bill.tenant_id == tenant_id)
+
+    # 查询总数
+    count_query = select(func.count(Bill.id))
+    if conditions:
+        count_query = count_query.where(and_(*conditions))
+    total = await db.scalar(count_query) or 0
+
+    # 查询数据
+    query = (
+        select(Bill, Tenant)
+        .join(Tenant, Bill.tenant_id == Tenant.tenant_id)
+    )
+    if conditions:
+        query = query.where(and_(*conditions))
+
+    query = query.order_by(Bill.created_at.desc())
+    query = query.offset((page - 1) * size).limit(size)
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    items = []
+    for bill, tenant in rows:
+        items.append({
+            "id": bill.id,
+            "bill_id": bill.bill_id,
+            "tenant_id": bill.tenant_id,
+            "company_name": tenant.company_name,
+            "billing_period": bill.billing_period,
+            "base_fee": float(bill.base_fee) if bill.base_fee else 0,
+            "discount": float(bill.discount) if bill.discount else 0,
+            "total_amount": float(bill.total_amount),
+            "status": bill.status,
+            "payment_method": bill.payment_method,
+            "payment_time": bill.payment_time.isoformat() if bill.payment_time else None,
+            "due_date": bill.due_date.isoformat() if bill.due_date else None,
+            "invoice_issued": bill.invoice_issued,
+            "created_at": bill.created_at.isoformat() if bill.created_at else None,
+        })
+
+    return ApiResponse(data={
+        "items": items,
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": (total + size - 1) // size,
+    })
+
+
+@router.get("/bills/pending")
+async def get_pending_bills(
+    admin: AdminDep,
+    db: DBDep,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    """
+    获取待审核账单列表
+    
+    返回状态为pending的账单
+    
+    权限：需要 BILLING_READ 权限
+    """
+    from models.tenant import Bill
+    from schemas.billing import PendingBillInfo
+    
+    # 查询待审核账单
+    stmt = (
+        select(Bill, Tenant)
+        .join(Tenant, Bill.tenant_id == Tenant.tenant_id)
+        .where(Bill.status == "pending")
+        .order_by(Bill.created_at.desc())
+    )
+    
+    # 获取总数
+    count_stmt = select(func.count(Bill.id)).where(Bill.status == "pending")
+    total = await db.scalar(count_stmt) or 0
+    
+    # 分页
+    stmt = stmt.offset((page - 1) * page_size).limit(page_size)
+    result = await db.execute(stmt)
+    rows = result.all()
+    
+    items = []
+    for bill, tenant in rows:
+        items.append(
+            PendingBillInfo(
+                bill_id=bill.bill_id,
+                tenant_id=bill.tenant_id,
+                company_name=tenant.company_name,
+                amount=float(bill.total_amount),
+                billing_period_start=bill.billing_period_start,
+                billing_period_end=bill.billing_period_end,
+                due_date=bill.due_date,
+                created_at=bill.created_at,
+            )
+        )
+    
+    response = {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": items,
+    }
+    
+    return ApiResponse(data=response)
+
+
+@router.post("/bills/{bill_id}/approve")
+async def approve_bill(
+    bill_id: str,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    审核通过账单
+    
+    将账单状态从pending改为approved
+    
+    权限：需要 BILLING_UPDATE 权限
+    """
+    from models.tenant import Bill
+    
+    # 查询账单
+    stmt = select(Bill).where(Bill.bill_id == bill_id)
+    result = await db.execute(stmt)
+    bill = result.scalar_one_or_none()
+    
+    if not bill:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="账单不存在")
+    
+    if bill.status != "pending":
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=f"账单状态为{bill.status}，无法审核")
+    
+    # 更新状态（这里假设审核通过后状态改为可支付状态）
+    # 实际业务中可能需要更复杂的状态转换
+    bill.status = "approved"  # 或者保持pending，等待支付
+    bill.updated_at = datetime.utcnow()
+    
+    await db.commit()
+    
+    # 记录审计日志
+    audit_service = AuditService(db)
+    await audit_service.log_operation(
+        admin_id=admin.admin_id,
+        operation_type="approve_bill",
+        resource_type="bill",
+        resource_id=bill_id,
+        operation_details={
+            "tenant_id": bill.tenant_id,
+            "amount": float(bill.total_amount),
+        },
+    )
+    
+    return ApiResponse(data={"message": "账单审核通过"})
+
+
+@router.post("/billing/{bill_id}/refund")
+async def refund_bill(
+    bill_id: str,
+    admin: AdminDep,
+    db: DBDep,
+    reason: str = Query(..., min_length=1, max_length=500, description="退款原因"),
+    amount: float | None = Query(None, gt=0, description="退款金额（不填则全额退款）"),
+):
+    """
+    处理账单退款
+
+    将已支付账单标记为退款状态
+
+    权限：需要 BILLING_UPDATE 权限
+    """
+    from models.tenant import Bill
+
+    stmt = select(Bill).where(Bill.bill_id == bill_id)
+    result = await db.execute(stmt)
+    bill = result.scalar_one_or_none()
+
+    if not bill:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="账单不存在")
+
+    if bill.status != "paid":
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=f"账单状态为{bill.status}，仅已支付账单可退款")
+
+    refund_amount = amount if amount is not None else bill.total_amount
+    if refund_amount > bill.total_amount:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="退款金额不能大于账单金额")
+
+    bill.refund_amount = refund_amount
+    bill.refund_reason = reason
+    bill.status = "refunded"
+    bill.updated_at = datetime.utcnow()
+
+    await db.commit()
+
+    audit_service = AuditService(db)
+    await audit_service.log_operation(
+        admin_id=admin.admin_id,
+        operation_type="refund_bill",
+        resource_type="bill",
+        resource_id=bill_id,
+        operation_details={
+            "tenant_id": bill.tenant_id,
+            "refund_amount": refund_amount,
+            "total_amount": float(bill.total_amount),
+            "reason": reason,
+        },
+    )
+
+    return ApiResponse(data={"message": "退款处理成功", "refund_amount": refund_amount})
+
+
+@router.post("/bills/{bill_id}/reject")
+async def reject_bill(
+    bill_id: str,
+    admin: AdminDep,
+    db: DBDep,
+    reason: str = Query(..., min_length=1, max_length=500, description="拒绝原因"),
+):
+    """
+    审核拒绝账单
+    
+    将账单状态从pending改为rejected
+    
+    权限：需要 BILLING_UPDATE 权限
+    """
+    from models.tenant import Bill
+    
+    # 查询账单
+    stmt = select(Bill).where(Bill.bill_id == bill_id)
+    result = await db.execute(stmt)
+    bill = result.scalar_one_or_none()
+    
+    if not bill:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="账单不存在")
+    
+    if bill.status != "pending":
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=f"账单状态为{bill.status}，无法审核")
+    
+    # 更新状态
+    bill.status = "rejected"
+    bill.updated_at = datetime.utcnow()
+    # 如果Bill模型有reject_reason字段，可以保存原因
+    # bill.reject_reason = reason
+    
+    await db.commit()
+    
+    # 记录审计日志
+    audit_service = AuditService(db)
+    await audit_service.log_operation(
+        admin_id=admin.admin_id,
+        operation_type="reject_bill",
+        resource_type="bill",
+        resource_id=bill_id,
+        operation_details={
+            "tenant_id": bill.tenant_id,
+            "amount": float(bill.total_amount),
+            "reject_reason": reason,
+        },
+    )
+    
+    return ApiResponse(data={"message": "账单已拒绝", "reason": reason})
+
+
+# ============ ISV 平台应用管理 ============
+@router.get(
+    "/platform-apps",
+    response_model=ApiResponse[list[PlatformAppResponse]],
+)
+async def list_platform_apps(
+    admin: AdminDep,
+    db: DBDep,
+    status: str | None = None,
+):
+    """
+    获取所有 ISV 平台应用配置
+
+    权限：所有管理员
+    """
+    stmt = select(PlatformApp)
+    if status:
+        stmt = stmt.where(PlatformApp.status == status)
+    stmt = stmt.order_by(PlatformApp.created_at.desc())
+
+    result = await db.execute(stmt)
+    apps = result.scalars().all()
+    return ApiResponse(data=apps)
+
+
+@router.get(
+    "/platform-apps/{app_id}",
+    response_model=ApiResponse[PlatformAppResponse],
+)
+async def get_platform_app(
+    app_id: int,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    获取 ISV 平台应用详情
+
+    权限：所有管理员
+    """
+    stmt = select(PlatformApp).where(PlatformApp.id == app_id)
+    result = await db.execute(stmt)
+    app = result.scalar_one_or_none()
+    if not app:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="平台应用不存在")
+    return ApiResponse(data=app)
+
+
+@router.post(
+    "/platform-apps",
+    response_model=ApiResponse[PlatformAppResponse],
+    dependencies=[Depends(require_admin_permission(Permission.TENANT_CREATE))],
+)
+async def create_platform_app(
+    app_data: PlatformAppCreate,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    创建 ISV 平台应用配置
+
+    app_secret 会自动加密后存储。
+
+    权限：super_admin, support_admin
+    """
+    # 检查 platform_type 是否已存在
+    existing = await db.execute(
+        select(PlatformApp).where(PlatformApp.platform_type == app_data.platform_type)
+    )
+    if existing.scalar_one_or_none():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail=f"平台 {app_data.platform_type} 的应用已存在")
+
+    app = PlatformApp(
+        platform_type=app_data.platform_type,
+        app_name=app_data.app_name,
+        app_key=app_data.app_key,
+        app_secret=encrypt_field(app_data.app_secret),
+        callback_url=app_data.callback_url,
+        webhook_url=app_data.webhook_url,
+        scopes=app_data.scopes,
+        status="active",
+        extra_config=app_data.extra_config,
+    )
+    db.add(app)
+    await db.commit()
+    await db.refresh(app)
+
+    # 审计日志
+    audit_service = AuditService(db)
+    await audit_service.log_operation(
+        admin_id=admin.admin_id,
+        operation_type="create_platform_app",
+        resource_type="platform_app",
+        resource_id=str(app.id),
+        operation_details={
+            "platform_type": app_data.platform_type,
+            "app_name": app_data.app_name,
+        },
+    )
+
+    return ApiResponse(data=app)
+
+
+@router.put(
+    "/platform-apps/{app_id}",
+    response_model=ApiResponse[PlatformAppResponse],
+    dependencies=[Depends(require_admin_permission(Permission.TENANT_CREATE))],
+)
+async def update_platform_app(
+    app_id: int,
+    update_data: PlatformAppUpdate,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    更新 ISV 平台应用配置
+
+    如果提供了 app_secret，会自动加密后存储。
+
+    权限：super_admin, support_admin
+    """
+    stmt = select(PlatformApp).where(PlatformApp.id == app_id)
+    result = await db.execute(stmt)
+    app = result.scalar_one_or_none()
+    if not app:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="平台应用不存在")
+
+    update_dict = update_data.model_dump(exclude_unset=True)
+    if "app_secret" in update_dict and update_dict["app_secret"]:
+        update_dict["app_secret"] = encrypt_field(update_dict["app_secret"])
+
+    for field, value in update_dict.items():
+        setattr(app, field, value)
+
+    await db.commit()
+    await db.refresh(app)
+
+    # 审计日志
+    audit_service = AuditService(db)
+    await audit_service.log_operation(
+        admin_id=admin.admin_id,
+        operation_type="update_platform_app",
+        resource_type="platform_app",
+        resource_id=str(app.id),
+        operation_details={
+            "platform_type": app.platform_type,
+            "updated_fields": list(update_dict.keys()),
+        },
+    )
+
+    return ApiResponse(data=app)
+
+
+@router.delete(
+    "/platform-apps/{app_id}",
+    response_model=ApiResponse[dict],
+    dependencies=[Depends(require_admin_permission(Permission.TENANT_CREATE))],
+)
+async def delete_platform_app(
+    app_id: int,
+    admin: AdminDep,
+    db: DBDep,
+):
+    """
+    删除 ISV 平台应用配置（物理删除）
+
+    注意：删除前请确保没有关联的租户配置在使用此应用。
+
+    权限：super_admin, support_admin
+    """
+    stmt = select(PlatformApp).where(PlatformApp.id == app_id)
+    result = await db.execute(stmt)
+    app = result.scalar_one_or_none()
+    if not app:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="平台应用不存在")
+
+    # 检查是否有关联的 PlatformConfig
+    from models.platform import PlatformConfig
+    config_stmt = select(func.count(PlatformConfig.id)).where(
+        PlatformConfig.platform_app_id == app_id
+    )
+    config_count = await db.scalar(config_stmt) or 0
+    if config_count > 0:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=400,
+            detail=f"该应用关联了 {config_count} 个租户配置，无法删除。请先断开相关连接。",
+        )
+
+    platform_type = app.platform_type
+
+    await db.delete(app)
+    await db.commit()
+
+    # 审计日志
+    audit_service = AuditService(db)
+    await audit_service.log_operation(
+        admin_id=admin.admin_id,
+        operation_type="delete_platform_app",
+        resource_type="platform_app",
+        resource_id=str(app_id),
+        operation_details={"platform_type": platform_type},
+    )
+
+    return ApiResponse(data={"message": "平台应用已删除"})
+

@@ -1,0 +1,367 @@
+"""
+RAG（检索增强生成）服务
+集成 Milvus 向量数据库和 Embedding 模型
+"""
+import logging
+from typing import Any
+
+from sqlalchemy import update as sa_update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from models import KnowledgeBase, KnowledgeUsageLog
+from services.embedding_service import EmbeddingService
+from services.knowledge_service import KnowledgeService
+from services.milvus_service import MilvusService
+
+logger = logging.getLogger(__name__)
+
+
+class RAGService:
+    """RAG 检索服务"""
+
+    def __init__(self, db: AsyncSession, tenant_id: str):
+        self.db = db
+        self.tenant_id = tenant_id
+        self.knowledge_service = KnowledgeService(db, tenant_id)
+        self.embedding_service = EmbeddingService(tenant_id)
+        try:
+            self.milvus_service = MilvusService(tenant_id)
+        except Exception as exc:
+            logger.warning("Milvus unavailable, using keyword-only RAG: %s", exc)
+            self.milvus_service = None
+
+    async def retrieve(
+        self,
+        query: str,
+        top_k: int = 5,
+        knowledge_type: str | None = None,
+        use_vector_search: bool = True,
+    ) -> list[dict]:
+        """
+        检索相关知识
+
+        Args:
+            query: 查询文本
+            top_k: 返回结果数量
+            knowledge_type: 知识类型过滤
+            use_vector_search: 是否使用向量搜索（否则使用关键词）
+
+        Returns:
+            检索结果列表
+        """
+        if use_vector_search and self.milvus_service:
+            try:
+                # 1. 将查询向量化
+                query_vector = await self.embedding_service.embed_text(query)
+
+                # 2. 在 Milvus 中搜索
+                # 构建过滤表达式
+                filter_expr = None
+                if knowledge_type:
+                    filter_expr = f"knowledge_type == '{knowledge_type}'"
+
+                vector_results = await self.milvus_service.search_vectors(
+                    query_vector=query_vector,
+                    top_k=top_k,
+                    filter_expr=filter_expr,
+                )
+
+                # 3. 从数据库获取完整信息
+                knowledge_ids = [r["knowledge_id"] for r in vector_results]
+                knowledge_items = await self.knowledge_service.get_knowledge_by_ids(
+                    knowledge_ids
+                )
+
+                # 4. 合并结果，按 chunk_id 去重，展示 chunk 文本
+                seen_chunk_ids: set[str] = set()
+                results = []
+                for vector_result in vector_results:
+                    chunk_id = vector_result["id"]
+                    if chunk_id in seen_chunk_ids:
+                        continue
+                    seen_chunk_ids.add(chunk_id)
+
+                    knowledge_id = vector_result["knowledge_id"]
+                    knowledge_item = next(
+                        (k for k in knowledge_items if k.knowledge_id == knowledge_id),
+                        None,
+                    )
+                    if knowledge_item:
+                        results.append({
+                            "knowledge_id": knowledge_item.knowledge_id,
+                            "chunk_id": chunk_id,
+                            "title": knowledge_item.title,
+                            "content": vector_result["content"],   # chunk 文本，非完整文档
+                            "score": vector_result["similarity"],
+                            "category": knowledge_item.category,
+                            "source": knowledge_item.source,
+                            "tags": knowledge_item.tags,
+                        })
+
+                # 记录检索日志
+                try:
+                    for result_item in results:
+                        usage_log = KnowledgeUsageLog(
+                            tenant_id=self.tenant_id,
+                            knowledge_id=result_item["knowledge_id"],
+                            conversation_id="retrieve",
+                            message_id="retrieve",
+                            query=query,
+                            match_score=result_item.get("score"),
+                            match_method="vector_search",
+                        )
+                        self.db.add(usage_log)
+                    await self.db.commit()
+                except Exception as log_err:
+                    import logging
+                    logging.getLogger(__name__).warning("Failed to log retrieval: %s", log_err)
+
+                return results
+
+            except Exception as e:
+                print(f"向量搜索失败，回退到关键词搜索: {e}")
+                # 回退到关键词搜索
+                return await self._keyword_search(query, top_k, knowledge_type)
+
+        else:
+            # 使用关键词搜索
+            return await self._keyword_search(query, top_k, knowledge_type)
+
+    async def _keyword_search(
+        self,
+        query: str,
+        top_k: int,
+        knowledge_type: str | None = None,
+    ) -> list[dict]:
+        """
+        关键词搜索（回退方案）
+
+        Args:
+            query: 查询文本
+            top_k: 返回结果数量
+            knowledge_type: 知识类型过滤
+
+        Returns:
+            搜索结果列表
+        """
+        knowledge_list = await self.knowledge_service.search_knowledge(
+            query=query,
+            knowledge_type=knowledge_type,
+            top_k=top_k,
+        )
+
+        results = []
+        for knowledge in knowledge_list:
+            results.append(
+                {
+                    "knowledge_id": knowledge.knowledge_id,
+                    "title": knowledge.title,
+                    "content": knowledge.content,
+                    "score": 0.8,  # 关键词搜索使用固定分数
+                    "category": knowledge.category,
+                    "source": knowledge.source,
+                    "tags": knowledge.tags,
+                }
+            )
+
+        return results
+
+    async def retrieve_and_generate(
+        self,
+        query: str,
+        conversation_history: list[dict] | None = None,
+        use_vector_search: bool = True,
+    ) -> dict:
+        """
+        检索并生成回复（RAG 完整流程）
+
+        Args:
+            query: 查询文本
+            conversation_history: 对话历史
+            use_vector_search: 是否使用向量搜索
+
+        Returns:
+            生成结果
+        """
+        # 1. 检索相关知识
+        retrieved_docs = await self.retrieve(
+            query=query,
+            top_k=3,
+            use_vector_search=use_vector_search,
+        )
+
+        # 2. 构建上下文
+        context = "\n\n".join(
+            [
+                f"[{doc['title']}]\n{doc['content']}\n（来源：{doc['source']}）"
+                for doc in retrieved_docs
+            ]
+        )
+
+        # 3. 使用对话链生成回复
+        from services import ConversationChainService
+
+        chain = ConversationChainService(
+            db=self.db,
+            tenant_id=self.tenant_id,
+            conversation_id="rag-query",  # 临时会话 ID
+        )
+
+        result = await chain.chat_with_rag(
+            user_input=query,
+            knowledge_items=retrieved_docs,
+        )
+
+        return result
+
+    async def index_knowledge(self, knowledge_id: str) -> dict[str, Any]:
+        """
+        为知识库项创建向量索引（按 chunk 逐片向量化，支持大文档）
+
+        Args:
+            knowledge_id: 知识库 ID
+
+        Returns:
+            索引结果
+        """
+        import uuid
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+        # 1. 获取知识库内容
+        knowledge = await self.knowledge_service.get_knowledge(knowledge_id)
+
+        # 2. 将内容重新切片（与 document_parser 保持一致的参数）
+        CHUNK_SIZE = 800
+        CHUNK_OVERLAP = 100
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+        )
+        chunks = splitter.split_text(knowledge.content) if knowledge.content else []
+        if not chunks:
+            chunks = [knowledge.title or knowledge.content or knowledge_id]
+
+        # 3. 批量生成向量
+        texts = [f"{knowledge.title}\n{chunk}" for chunk in chunks]
+        vectors = await self.embedding_service.embed_documents(texts)
+
+        if not self.milvus_service:
+            await self.db.execute(
+                sa_update(KnowledgeBase)
+                .where(KnowledgeBase.knowledge_id == knowledge_id)
+                .values(
+                    embedding_vector_id=f"local-{knowledge_id}",
+                    embedding_model=self.embedding_service.get_model_name(),
+                    chunk_count=len(chunks),
+                )
+            )
+            await self.db.commit()
+            return {
+                "knowledge_id": knowledge_id,
+                "vector_id": f"local-{knowledge_id}",
+                "chunk_count": len(chunks),
+                "indexed": True,
+                "mode": "keyword_only",
+            }
+
+        # 4. 准备 Milvus 插入数据
+        knowledge_items = []
+        first_vector_id = None
+
+        for chunk in chunks:
+            vector_id = str(uuid.uuid4())
+            if first_vector_id is None:
+                first_vector_id = vector_id
+            knowledge_items.append(
+                {
+                    "id": vector_id,
+                    "knowledge_id": knowledge.knowledge_id,
+                    "content": chunk,
+                }
+            )
+
+        # 5. 批量插入 Milvus
+        dim = len(vectors[0]) if vectors else None
+        await self.milvus_service.insert_vectors(
+            knowledge_items=knowledge_items,
+            vectors=vectors,
+            dimension=dim,
+        )
+
+        # 6. 更新 DB 记录的向量 ID 和模型名称
+        await self.db.execute(
+            sa_update(KnowledgeBase)
+            .where(KnowledgeBase.knowledge_id == knowledge_id)
+            .values(
+                embedding_vector_id=first_vector_id,
+                embedding_model=self.embedding_service.get_model_name(),
+            )
+        )
+        await self.db.commit()
+
+        return {
+            "knowledge_id": knowledge_id,
+            "vector_id": first_vector_id,
+            "chunk_count": len(chunks),
+            "indexed": True,
+        }
+
+    async def index_batch_knowledge(
+        self,
+        knowledge_ids: list[str],
+    ) -> dict[str, Any]:
+        """
+        批量索引知识库
+
+        Args:
+            knowledge_ids: 知识库 ID 列表
+
+        Returns:
+            批量索引结果
+        """
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for knowledge_id in knowledge_ids:
+            try:
+                await self.index_knowledge(knowledge_id)
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                errors.append({"knowledge_id": knowledge_id, "error": str(e)})
+
+        return {
+            "total": len(knowledge_ids),
+            "success": success_count,
+            "failed": failed_count,
+            "errors": errors,
+        }
+
+    async def delete_knowledge_vectors(self, knowledge_ids: list[str]) -> int:
+        """
+        删除知识库向量
+
+        Args:
+            knowledge_ids: 知识库 ID 列表
+
+        Returns:
+            删除数量
+        """
+        count = await self.milvus_service.delete_vectors(knowledge_ids)
+        return count
+
+    def get_stats(self) -> dict[str, Any]:
+        """
+        获取 RAG 统计信息
+
+        Returns:
+            统计信息
+        """
+        milvus_stats = self.milvus_service.get_collection_stats()
+        embedding_info = self.embedding_service.get_model_info()
+
+        return {
+            "tenant_id": self.tenant_id,
+            "milvus": milvus_stats,
+            "embedding": embedding_info,
+        }

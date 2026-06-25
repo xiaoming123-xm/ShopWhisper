@@ -1,0 +1,120 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+!frontend/src/lib/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.*.local
+*.env
+
+# Allow example and template files
+!.env.example
+!.env.development
+!.env.production.template
+!backend/.env.example
+!backend/.env.production.template
+!frontend/.env.example
+!frontend/.env.development
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+log/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+backend/reports/
+test-reports/
+.benchmarks/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Docker
+docker-compose.override.yml
+
+# Alembic
+alembic/versions/*.py
+!alembic/versions/.gitkeep
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# MacOS
+.DS_Store
+
+# Cursor
+.cursor/
+
+# Payment Keys (Private)
+backend/keys/
+*.pem
+
+# Git Worktrees
+.worktrees/
+
+# Temporary Docs
+Day1*.md
+实现完成*.md
+部署完成*.md
+nohup.out

@@ -1,0 +1,370 @@
+'use client';
+
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { Row, Col, Card, Button, Statistic, message, Typography, Tabs } from 'antd';
+import Skeleton from '@/components/ui/Loading/Skeleton';
+import {
+  PlusOutlined, FileTextOutlined, AppstoreOutlined, CloudOutlined,
+  QuestionCircleOutlined, BarChartOutlined, BulbOutlined,
+} from '@ant-design/icons';
+import {
+  DocumentList,
+  UploadModal,
+  EnhancedRetrievalTest,
+  QAPairList,
+  RAGAnalyticsDashboard,
+  CandidateReviewQueue,
+} from '@/components/knowledge';
+import { knowledgeApi, KnowledgeItem } from '@/lib/api/knowledge';
+import { KnowledgeDocument, KnowledgeSearchResult } from '@/types';
+
+const { Title } = Typography;
+
+// Transform backend KnowledgeItem to frontend KnowledgeDocument
+const transformToDocument = (item: KnowledgeItem): KnowledgeDocument => ({
+  id: item.id,
+  knowledge_id: item.knowledge_id,
+  title: item.title,
+  file_type: item.knowledge_type,
+  file_size: 0, // Not provided by backend
+  chunk_count: item.chunk_count,
+  status: item.embedding_status === 'completed' ? 'completed' :
+          item.embedding_status === 'processing' ? 'processing' :
+          item.embedding_status === 'failed' ? 'failed' : 'pending',
+  uploaded_at: item.created_at,
+});
+
+export default function KnowledgePage() {
+  const [activeTab, setActiveTab] = useState('documents');
+  const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [uploadModalOpen, setUploadModalOpen] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [searchValue, setSearchValue] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [searching, setSearching] = useState(false);
+  const [statusFilter, setStatusFilter] = useState('');
+  const [pagination, setPagination] = useState({
+    current: 1,
+    pageSize: 10,
+    total: 0,
+  });
+
+  // Stats
+  const [stats, setStats] = useState({
+    totalDocuments: 0,
+    totalChunks: 0,
+    storageUsed: 0,
+  });
+
+  // Load stats from dedicated endpoint
+  const loadStats = useCallback(async () => {
+    try {
+      const resp = await knowledgeApi.getStats();
+      if (resp.success && resp.data) {
+        setStats({
+          totalDocuments: resp.data.total_documents,
+          totalChunks: resp.data.total_chunks,
+          storageUsed: resp.data.storage_used_mb ?? 0,
+        });
+      }
+    } catch (err) {
+      console.error('Failed to load stats:', err);
+    }
+  }, []);
+
+  // Polling ref
+  const pollingRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollingIntervalRef = useRef<number>(3000);
+
+  const stopPolling = useCallback(() => {
+    if (pollingRef.current) {
+      clearTimeout(pollingRef.current);
+      pollingRef.current = null;
+    }
+    pollingIntervalRef.current = 3000;
+  }, []);
+
+  const startPolling = useCallback((pageSize: number) => {
+    stopPolling();
+
+    const poll = async () => {
+      // 页面不可见时暂停
+      if (document.visibilityState === 'hidden') {
+        pollingRef.current = setTimeout(poll, pollingIntervalRef.current);
+        return;
+      }
+      try {
+        const resp = await knowledgeApi.list({ page: 1, size: pageSize });
+        if (resp.success && resp.data) {
+          const items = resp.data.items || [];
+          setDocuments(items.map(transformToDocument));
+          const allDone = items.every(
+            (i) => i.embedding_status === 'completed' || i.embedding_status === 'failed'
+          );
+          if (allDone) {
+            stopPolling();
+            return;
+          }
+          await loadStats();
+        }
+      } catch {
+        // 轮询失败静默处理，不中断轮询
+      }
+      // 指数退避：3s → 6s → 12s → 30s（上限）
+      pollingIntervalRef.current = Math.min(pollingIntervalRef.current * 2, 30000);
+      pollingRef.current = setTimeout(poll, pollingIntervalRef.current);
+    };
+
+    pollingRef.current = setTimeout(poll, pollingIntervalRef.current);
+  }, [stopPolling, loadStats]);
+
+  // Cleanup on unmount
+  useEffect(() => () => stopPolling(), [stopPolling]);
+
+  // Load documents
+  const loadDocuments = useCallback(async (page: number, pageSize: number, keyword: string) => {
+    try {
+      if (keyword) setSearching(true);
+      else setLoading(true);
+      const response = await knowledgeApi.list({
+        keyword: keyword || undefined,
+        page,
+        size: pageSize,
+      });
+
+      if (response.success && response.data) {
+        const items = response.data.items || [];
+        setDocuments(items.map(transformToDocument));
+        setPagination((prev) => ({
+          ...prev,
+          total: response.data?.total || 0,
+        }));
+      }
+    } catch (err) {
+      console.error('Failed to load documents:', err);
+      message.error('加载文档列表失败');
+    } finally {
+      setLoading(false);
+      setSearching(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchValue);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [searchValue]);
+
+  useEffect(() => {
+    loadDocuments(pagination.current, pagination.pageSize, debouncedSearch);
+    loadStats();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadDocuments, loadStats, pagination.current, pagination.pageSize, debouncedSearch]);
+
+  const handleUpload = async (files: File[]) => {
+    setUploading(true);
+    try {
+      for (const file of files) {
+        await knowledgeApi.uploadFile(file);
+      }
+      message.success(`成功上传 ${files.length} 个文件`);
+      setUploadModalOpen(false);
+      await loadDocuments(pagination.current, pagination.pageSize, searchValue);
+      await loadStats();
+      startPolling(pagination.pageSize);
+    } catch (err) {
+      console.error('Failed to upload:', err);
+      message.error('上传失败');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    try {
+      const response = await knowledgeApi.delete(id);
+      if (response.success) {
+        setDocuments((prev) => prev.filter((d) => d.knowledge_id !== id));
+        message.success('删除成功');
+      } else {
+        message.error(response.error?.message || '删除失败');
+      }
+    } catch (err) {
+      console.error('Failed to delete:', err);
+      message.error('删除失败');
+    }
+  };
+
+  const handlePreview = (doc: KnowledgeDocument) => {
+    message.info(`预览: ${doc.title}`);
+    // TODO: Open preview modal
+  };
+
+  const handleSearch = async (query: string, rerankModelId?: number): Promise<KnowledgeSearchResult[]> => {
+    try {
+      const response = await knowledgeApi.ragQuery({
+        query,
+        top_k: 1,
+        use_rerank: !!rerankModelId,
+      });
+      if (response.success && response.data) {
+        return response.data.results.slice(0, 1).map((item) => ({
+          knowledge_id: item.knowledge_id,
+          title: item.title,
+          content: typeof item.content === 'string'
+            ? item.content.substring(0, 200) + '...'
+            : String(item.content || ''),
+          score: item.score || 0.9,
+          source: item.source || '',
+        }));
+      }
+      return [];
+    } catch (err) {
+      console.error('Search failed:', err);
+      return [];
+    }
+  };
+
+  const handlePaginationChange = (page: number, pageSize: number) => {
+    setPagination((prev) => ({ ...prev, current: page, pageSize }));
+  };
+
+  // Filter documents by status (client-side filtering for status)
+  const filteredDocuments = documents.filter((doc) => {
+    const matchesStatus = !statusFilter || doc.status === statusFilter;
+    return matchesStatus;
+  });
+
+  const tabItems = [
+    {
+      key: 'documents',
+      label: (
+        <span><FileTextOutlined /> 文档管理</span>
+      ),
+      children: (
+        <div className="space-y-6">
+          {/* Stats */}
+          <Row gutter={[16, 16]}>
+            <Col xs={24} sm={8}>
+              <Card>
+                <Statistic
+                  title="总文档数"
+                  value={stats.totalDocuments}
+                  prefix={<FileTextOutlined />}
+                />
+              </Card>
+            </Col>
+            <Col xs={24} sm={8}>
+              <Card>
+                <Statistic
+                  title="向量切片总数"
+                  value={stats.totalChunks}
+                  prefix={<AppstoreOutlined />}
+                  formatter={(value) => value?.toLocaleString()}
+                />
+              </Card>
+            </Col>
+            <Col xs={24} sm={8}>
+              <Card>
+                <Statistic
+                  title="存储占用"
+                  value={stats.storageUsed}
+                  suffix="MB"
+                  prefix={<CloudOutlined />}
+                />
+              </Card>
+            </Col>
+          </Row>
+
+          {/* Document List */}
+          <Card title="文档列表">
+            {loading && !searching ? (
+              <div className="py-4">
+                <Skeleton variant="table" rows={5} />
+              </div>
+            ) : (
+              <DocumentList
+                documents={filteredDocuments}
+                loading={searching}
+                searchValue={searchValue}
+                statusFilter={statusFilter}
+                onSearchChange={setSearchValue}
+                onStatusFilterChange={setStatusFilter}
+                onPreview={handlePreview}
+                onDelete={handleDelete}
+                pagination={{
+                  current: pagination.current,
+                  pageSize: pagination.pageSize,
+                  total: pagination.total,
+                  onChange: handlePaginationChange,
+                }}
+              />
+            )}
+          </Card>
+
+          {/* Enhanced Retrieval & RAG Test */}
+          <EnhancedRetrievalTest
+            onSearch={handleSearch}
+            rerankModels={[]}
+          />
+        </div>
+      ),
+    },
+    {
+      key: 'qa',
+      label: (
+        <span><QuestionCircleOutlined /> 问答对</span>
+      ),
+      children: <QAPairList />,
+    },
+    {
+      key: 'analytics',
+      label: (
+        <span><BarChartOutlined /> 检索分析</span>
+      ),
+      children: <RAGAnalyticsDashboard />,
+    },
+    {
+      key: 'extraction',
+      label: (
+        <span><BulbOutlined /> 智能提取</span>
+      ),
+      children: <CandidateReviewQueue />,
+    },
+  ];
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex justify-between items-center">
+        <Title level={4} className="mb-0">知识库管理</Title>
+        {activeTab === 'documents' && (
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={() => setUploadModalOpen(true)}
+          >
+            上传新文档
+          </Button>
+        )}
+      </div>
+
+      {/* Tabs */}
+      <Tabs
+        activeKey={activeTab}
+        onChange={setActiveTab}
+        items={tabItems}
+      />
+
+      {/* Upload Modal */}
+      <UploadModal
+        open={uploadModalOpen}
+        onClose={() => setUploadModalOpen(false)}
+        onUpload={handleUpload}
+        uploading={uploading}
+      />
+    </div>
+  );
+}
