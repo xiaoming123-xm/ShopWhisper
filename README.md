@@ -1,6 +1,5 @@
 <div align="center">
   <img src="./frontend/public/logos/logo.svg" alt="ShopWhisper Logo" width="200"/>
-
   # 电商智能客服 & AI 内容生成 SaaS 平台
 
   基于大模型的多租户电商 SaaS 平台，集智能客服、AI 内容生成、商品管理、智能定价于一体，提供完整的前后端解决方案。
