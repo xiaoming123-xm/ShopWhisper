@@ -1,5 +1,3 @@
-<div align="center">
-  <img src="./frontend/public/logos/logo.svg" alt="ShopWhisper Logo" width="200"/>
 
   # 电商智能客服 & AI 内容生成 SaaS 平台
 
